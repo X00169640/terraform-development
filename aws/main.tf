@@ -11,6 +11,11 @@ provider "aws" {
   region = "eu-west-1"
 }
 
+resource "aws_key_pair" "keypair" {
+  key_name   = "diarmaid-key"
+  public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCwS/sf75LjdVHcSkiTY8Ixvk9fMCrf72xTsmtgkqmFpW3akKYz+UGrPojNaNPqNLbiQ+G3MRwnKRIH5xu1CgRct7knpE0cIEjv4ObcvcX0FvvDYMh+fyXqLy4ko7V4pPFPpzHxB0HwFTDOGGvvYHA6L2NqiSpDkiK3bM+525A/pyR8+Y72xxdRXcamrIUEkHSNJxy2G/xElEczBa8Pz+4Kakj9i4/T9SUUI6CHByjn4SZQsMvGzYzCv0uMZwe5qsjE4gnBVSz89Y6yJr0QHzb6y/NKkshivnniMz5JikfcBtbnEPlkt4jNes7c3VnY3//+4tAEo4Ix3tCZqsmdwPLT diarmaid@developmen"
+}
+
 # Define VPC
 resource "aws_vpc" "main" {
   cidr_block = var.vpc_cidr_block
@@ -96,16 +101,16 @@ resource "aws_route_table_association" "public_subnet_route_table_association" {
 
 ##### Web tier config
 
-# Web - Application Load Balancer
-resource "aws_lb" "app_lb" {
-  name = "app-lb"
+# Web - ELB
+resource "aws_lb" "webapp_lb" {
+  name = "webapp-lb"
   internal = false
   load_balancer_type = "application"
   security_groups = [aws_security_group.alb_http.id]
   subnets = [for value in aws_subnet.public_subnet: value.id]
 }
 
-# Web - ALB Security Group
+# Web - ELB Security Group
 resource "aws_security_group" "alb_http" {
   name        = "alb-security-group"
   description = "Allowing HTTP requests to the application load balancer"
@@ -114,6 +119,12 @@ resource "aws_security_group" "alb_http" {
   ingress {
     from_port   = 80
     to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  ingress {
+    from_port   = 22
+    to_port     = 22
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
@@ -132,7 +143,7 @@ resource "aws_security_group" "alb_http" {
 
 # Web - Listener
 resource "aws_lb_listener" "web_listener" {
-  load_balancer_arn = aws_lb.app_lb.arn
+  load_balancer_arn = aws_lb.webapp_lb.arn
   port              = "80"
   protocol          = "HTTP"
 
@@ -165,6 +176,15 @@ resource "aws_security_group" "web_instance_sg" {
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
+    cidr_blocks      = ["0.0.0.0/0"]
+    security_groups = [aws_security_group.alb_http.id]
+  }
+
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks      = ["0.0.0.0/0"]
     security_groups = [aws_security_group.alb_http.id]
   }
 
@@ -180,32 +200,37 @@ resource "aws_security_group" "web_instance_sg" {
   }
 }
 
-# Web - Launch Template
-resource "aws_launch_template" "web_launch_template" {
-  name_prefix   = "web-launch-template"
-  image_id      = "ami-0b93581e415b1656e"
-  instance_type = "t2.micro"
+resource "aws_instance" "ec2webinstances" {
+  for_each = aws_subnet.public_subnet
+  ami           = "ami-06ce3edf0cff21f07"
+  associate_public_ip_address = true
+  key_name = aws_key_pair.keypair.key_name
+  vpc_security_group_ids = [aws_security_group.web_instance_sg.id]
+  availability_zone = each.key
+  subnet_id = each.value.id
+  instance_type = "t1.micro"
+  user_data     = <<-EOF
+                  #!/bin/bash
+                  sudo su
+                  yum -y install httpd
+                  sudo systemctl start httpd
+                  EOF
+  tags = {
+    Name = "aws-terraform-webserver-${each.key}"
+  }
 }
 
-# Web - Auto Scaling Group
-resource "aws_autoscaling_group" "web_asg" {
-  desired_capacity   = 0
-  max_size           = 0
-  min_size           = 0
-  target_group_arns = [aws_lb_target_group.web_target_group.arn]
-  vpc_zone_identifier = [for value in aws_subnet.public_subnet: value.id]
 
-  launch_template {
-    id      = aws_launch_template.web_launch_template.id
-    version = "$Latest"
-  }
+
+output "public_web_ips" {
+  value = values(aws_instance.ec2webinstances)[*] #.public_ip
 }
 
 
 ### App section
 
-# App - ALB Security Group
-resource "aws_security_group" "alb_app_http" {
+# App - LB Security Group
+resource "aws_security_group" "app_lb_sg" {
   name        = "alb-app-security-group"
   description = "Allowing HTTP requests to the app tier application load balancer"
   vpc_id = aws_vpc.main.id
@@ -234,7 +259,7 @@ resource "aws_lb" "app_app_lb" {
   name = "app-app-lb"
   internal = false
   load_balancer_type = "application"
-  security_groups = [aws_security_group.alb_app_http.id]
+  security_groups = [aws_security_group.app_lb_sg.id]
   subnets = [for value in aws_subnet.private_subnet: value.id]
 }
 
@@ -273,7 +298,7 @@ resource "aws_security_group" "app_instance_sg" {
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
-    security_groups = [aws_security_group.alb_app_http.id]
+    security_groups = [aws_security_group.app_lb_sg.id]
   }
 
   egress {
@@ -288,29 +313,21 @@ resource "aws_security_group" "app_instance_sg" {
   }
 }
 
-# App - Launch Template
-resource "aws_launch_template" "app_launch_template" {
-  name_prefix   = "app-launch-template"
-  image_id      = "ami-0b93581e415b1656e"
-  instance_type = "t2.micro"
+resource "aws_instance" "ec2appinstances" {
+  for_each = aws_subnet.private_subnet
+  ami           = "ami-06ce3edf0cff21f07"
+  associate_public_ip_address = false
+  key_name = aws_key_pair.keypair.key_name
   vpc_security_group_ids = [aws_security_group.app_instance_sg.id]
-}
-
-# App - Auto Scaling Group
-resource "aws_autoscaling_group" "app_asg" {
-  desired_capacity   = 0
-  max_size           = 0
-  min_size           = 0
-  target_group_arns = [aws_lb_target_group.app_target_group.arn]
-  vpc_zone_identifier = [for value in aws_subnet.private_subnet: value.id]
-
-  launch_template {
-    id      = aws_launch_template.app_launch_template.id
-    version = "$Latest"
+  availability_zone = each.key
+  subnet_id = each.value.id
+  instance_type = "t1.micro"
+  tags = {
+    Name = "aws-terraform-appserver-${each.key}"
   }
 }
 
-# DB - Security Group
+# # DB - Security Group
 resource "aws_security_group" "db_security_group" {
   name = "aws-terraform-db-sg"
   description = "RDS postgres server"
@@ -344,8 +361,8 @@ resource "aws_db_subnet_group" "db_subnet" {
 
 # DB - RDS Instance
 resource "aws_db_instance" "db_postgres" {
-  allocated_storage        = 20 # gigabytes
-  backup_retention_period  = 7   # in days
+  allocated_storage        = 10
+  backup_retention_period  = 0
   db_subnet_group_name     = aws_db_subnet_group.db_subnet.name
   engine                   = "postgres"
   engine_version           = "12.4"
