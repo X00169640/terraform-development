@@ -359,7 +359,7 @@ resource "aws_db_subnet_group" "db_subnet" {
   }
 }
 
-# DB - RDS Instance
+# # DB - RDS Instance
 resource "aws_db_instance" "db_postgres" {
   allocated_storage        = 10
   backup_retention_period  = 0
